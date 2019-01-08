@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 26 13:28:12 2018
+
+@author: miles
+"""
+import pip #to install xgboost from local whl file
+from pandas import DataFrame, read_csv
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import xgboost as xgb 
+import pandas as pd
+import os
+import re
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+plt.style.use('fivethirtyeight')
+
+
+os.chdir('C:/Users/miles/Desktop/COI_baseline')
+input_file= 'LD2011_2014.txt'
+
+#clean and rename datetime column: 'record_ts'
+def create_refined_df(input_filename):
+    input_file = input_filename
+    df = pd.read_csv(input_file, sep = ';', low_memory = False)
+    df.rename(columns={'Unnamed: 0' : 'record_ts'}, inplace = True)
+    df['record_ts'] = pd.to_datetime(df['record_ts'])
+    for col in df.columns[1: ]:
+        df[col] = pd.to_numeric(df[col].apply(lambda x: re.sub(',', '.', str(x))))
+    return df
+
+# use function above on filename
+df = create_refined_df(input_file)
+
+#look at data
+df.head(2)
+
+#function for keeping only observations observed after '2011-12-31 23:45:00' & set record_ts as index
+def filter_df(input_df):
+    df = input_df
+    df_wdata = df.iloc[:, 0:13]
+    df_filtered = df_wdata[df_wdata['record_ts'] > '2011-12-31 23:45:00']
+    df_filtered.set_index('record_ts', inplace = True)
+    return df_filtered
+
+#use function above 
+filtered_df = filter_df(df)
+
+    
+
+#function for creating features
+def create_features_online(df_in, label=None):
+    
+    df = pd.DataFrame(df_in.copy())
+    df['datetime'] = df.index
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+    df['hour'] = df['datetime'].dt.hour
+    df['dayofmonth'] = df['datetime'].dt.day
+    df['dayofyear'] = df['datetime'].dt.dayofyear
+    df['minute'] = df['datetime'].dt.minute
+    df["weekday"] = df.index.weekday
+    df['is_weekend'] = df.weekday.isin([5,6])*1
+    
+    #encode_cols = ['month', 'weekday', 'is_weekend']
+    #df = get_onehot(df, encode_cols)
+    
+    #from sklearn.preprocessing import PolynomialFeatures
+    #interaction = PolynomialFeatures(degree=3, include_bias=False, interaction_only=True)
+    #df['inter_hy_X'] = interaction.fit_transform(df['hour'] * df['dayofyear'] )
+      
+    #make lag features
+    shift_constant = 95
+    lag_start = 1
+    lag_end = 4
+    for i in range(lag_start, lag_end):
+        df["lag_{}".format(i)] = df[label].shift(i + shift_constant)
+    rolling_window = 4      
+    df['rolling_mean_hour'] = df[label].shift(shift_constant).rolling(window=rolling_window).mean()
+    df['rolling_sum_mins'] = df[label].shift(shift_constant).rolling(window=rolling_window).sum()
+    df['rol_max_hour'] = df[label].shift(shift_constant).rolling(window=rolling_window).max()
+    df['rol_min_hour'] = df[label].shift(shift_constant).rolling(window=rolling_window).min()
+    df['rol_stddev_hour'] = df[label].shift(shift_constant).rolling(window=rolling_window).std()
+
+    cols = [0,1]
+    df.drop(df.columns[cols], axis = 1, inplace = True)
+    features_X = df
+    
+    
+    
+    #for scaling features (not using)
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    
+    if label:
+        feature_y = df_in[label]
+        return features_X, feature_y
+    return features_X
+
+
+# create training and test data for MT_004 model
+y_label = 'MT_004'
+structured_data = pd.DataFrame(filtered_df[y_label].copy()) #.iloc[:,[3]]
+#structured_data = structured_data.loc[structured_data[y_label] != 0.0 ]
+split_datetime = '2014-11-01 00:00:00'
+split_datetime_heldout = '2014-12-01 00:00:00'
+
+## History until Novemeber 2014 - used for Train
+mt_train = structured_data.loc[structured_data.index < split_datetime].copy()
+## November for model test 
+mt_test = structured_data.loc[(structured_data.index >= split_datetime) & (structured_data.index < split_datetime_heldout) ].copy()
+X_train, Y_train = create_features_online(mt_train, y_label)
+X_test, Y_test = create_features_online(mt_test, y_label)
+
+
+
+
+
+#function for training model
+def execute_model(X_train, Y_train, X_test, Y_test):
+    reg = xgb.XGBRegressor(n_estimators = 1000, colsample_bytree = 0.92, gamma = 0.41, max_depth = 5, min_child_weight = 4, reg_lambda = 0.21, subsample = 0.90)   
+    reg.fit(X_train, Y_train,
+            eval_set = [(X_train, Y_train), (X_test, Y_test)],
+            early_stopping_rounds = 50,
+          verbose = True)
+    return reg
+
+help(reg.fit)
+
+#run training function above
+reg = execute_model(X_train, Y_train, X_test, Y_test)
+
+#get the predictions
+mt_test['Predicted_MT'] = reg.predict(X_test)
+
+#look at the predictions and realization
+mt_test.head(5)
+mt_test.tail(5)
+
+
+
+def mean_absolute_percentage_error(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    y_true[y_true == 0.0] = 1.0
+    y_pred[y_true == 0.0] = 1.0
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+
+                 
+mean_absolute_percentage_error(y_true=mt_test['MT_004'],
+                               y_pred = mt_test['Predicted_MT'])
+ 
+###plotting 
+#plt.plot(mt_test['MT_006'])
+#plt.plot(mt_test['Predicted_MT'])
+#plt.plot(mt_test[['Predicted_MT','MT_006']].plot(
+#                                              style=['-','.']))
+
+###write out result for further testing data set
+#mt_test.to_csv('res_MT008.csv')##MT_008 7.4415  if day 1 of prediction is removed ##6.835574
+#mt_test.to_csv('res_MT004.csv')##MT_004 9.5131  if day 1 of prediction is removed ##8.661945
+#mt_test.to_csv('res_MT006.csv')##MT_006 10.8794  if day 1 of prediction is removed ##8.3040
+#mt_test.to_csv('res_MT009.csv')##MT_009 15.9375  if day 1 of prediction is removed ##13.91767
+#mt_test.to_csv('res_MT011.csv')##MT_011 10.9102  if day 1 of prediction is removed ##09.941006
